@@ -296,3 +296,30 @@ docker compose up -d --force-recreate
 docker compose logs -f recon
 docker compose ps
 ```
+
+### S3
+
+啟動後，用 AWS CLI 連：
+
+```powershell
+$env:AWS_ACCESS_KEY_ID="test"
+$env:AWS_SECRET_ACCESS_KEY="test"
+aws configure set default.s3.addressing_style path
+aws --endpoint-url http://localhost:9878 s3api list-buckets
+```
+
+你這個 compose 沒有開 Ozone security，所以 access key / secret 可以先用任意值，例如 `test/test`。
+
+建立 bucket、上傳、下載：
+
+```powershell
+aws --endpoint-url http://localhost:9878 s3api create-bucket --bucket bucket1
+
+aws --endpoint-url http://localhost:9878 s3 cp README.md s3://bucket1/README.md
+
+aws --endpoint-url http://localhost:9878 s3 ls s3://bucket1/
+
+aws --endpoint-url http://localhost:9878 s3 cp s3://bucket1/README.md .\README.download.md
+```
+
+Ozone S3 bucket 會對應到 Ozone 內部的 `/s3v` volume 底下。官方文件也說明：S3 Gateway 是額外服務，S3 buckets 會存在 `/s3v`，未啟用 security 時可以用任意 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。參考：[Ozone S3 API docs](https://ozone.apache.org/docs/user-guide/client-interfaces/s3/s3-api)。

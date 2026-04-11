@@ -109,6 +109,26 @@ services:
     volumes:
       - recon-metadata:/data/metadata
 
+  s3g:
+    <<: *ozone-image
+    container_name: ozone-s3g
+    command:
+      - bash
+      - -c
+      - |
+        until </dev/tcp/om/9874; do
+          echo "Waiting for om:9874"
+          sleep 2
+        done
+        exec ozone s3g
+    depends_on:
+      - om
+    environment:
+      <<: *ozone-common-config
+      OZONE-SITE.XML_ozone.s3g.http-address: 0.0.0.0:9878
+    ports:
+      - "9878:9878"
+
 networks:
   ozone:
     name: ozone
