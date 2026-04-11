@@ -7,6 +7,8 @@
 - DataNode: `datanode`
 - Recon: `recon`
 
+這份 compose 是單 DataNode 測試環境，因此已設定 `hdds.scm.safemode.min.datanode=1`。如果改成多 DataNode 或正式環境，請依實際節點數調整 safe mode 設定。
+
 ## 環境需求
 
 - Docker
@@ -72,7 +74,8 @@ SCM 和 Recon RPC 服務對外開放在：
 確認 Ozone CLI 可連到服務：
 
 ```powershell
-docker compose exec om ozone admin om roles
+docker compose exec om ozone sh volume list /
+docker compose exec om ozone admin datanode list
 ```
 
 查看容器內 Ozone 設定：
