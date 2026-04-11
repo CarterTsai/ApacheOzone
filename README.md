@@ -94,6 +94,95 @@ docker compose exec om ozone sh volume list /
 docker compose exec om ozone sh bucket list /testvol
 ```
 
+## Freon 壓測
+
+Apache Ozone 內建 Freon 作為 load generator / tester。可先查看可用的壓測命令：
+
+```powershell
+docker compose exec om ozone freon --help
+```
+
+查看 `randomkeys` 參數：
+
+```powershell
+docker compose exec om ozone freon randomkeys --help
+```
+
+### 寫入 key 壓測
+
+以下範例會建立 1 個 volume、1 個 bucket，並寫入 1000 個 10KB key：
+
+```powershell
+docker compose exec om ozone freon randomkeys `
+  --num-of-volumes=1 `
+  --num-of-buckets=1 `
+  --num-of-keys=1000 `
+  --key-size=10KB `
+  --num-of-threads=10 `
+  --type=RATIS `
+  --replication=ONE
+```
+
+這份 compose 是單 DataNode 環境，請使用 `--replication=ONE`。不要使用 Freon 預設的 replication factor `THREE`，否則會因為 DataNode 數量不足導致壓測失敗或卡住。
+
+### 小量測試
+
+第一次測試可以先用較小的 key 數量確認流程：
+
+```powershell
+docker compose exec om ozone freon randomkeys `
+  --num-of-volumes=1 `
+  --num-of-buckets=1 `
+  --num-of-keys=10 `
+  --key-size=1KB `
+  --num-of-threads=2 `
+  --type=RATIS `
+  --replication=ONE
+```
+
+### 驗證寫入
+
+壓測時加上 `--validate-writes` 可以在寫入後驗證 key：
+
+```powershell
+docker compose exec om ozone freon randomkeys `
+  --num-of-volumes=1 `
+  --num-of-buckets=1 `
+  --num-of-keys=100 `
+  --key-size=10KB `
+  --num-of-threads=5 `
+  --type=RATIS `
+  --replication=ONE `
+  --validate-writes
+```
+
+### 清理測試資料
+
+`randomkeys` 可加上 `--clean-objects` 清理 Freon 隨機建立的 volume、bucket 和 key：
+
+```powershell
+docker compose exec om ozone freon randomkeys `
+  --num-of-volumes=1 `
+  --num-of-buckets=1 `
+  --num-of-keys=100 `
+  --key-size=10KB `
+  --num-of-threads=5 `
+  --type=RATIS `
+  --replication=ONE `
+  --clean-objects
+```
+
+### 常用 Freon 子命令
+
+- `randomkeys` / `rk`: 建立 volume、bucket，並寫入隨機 key
+- `ockg`: 使用 Ozone client 建立 key
+- `ockv`: 驗證 key
+- `ockr`: 刪除 key
+- `om-echo`: 測試 OM RPC
+- `dn-echo`: 測試 DataNode RPC
+- `scm-throughput-benchmark`: 測試 SCM throughput
+- `s3kg`: 透過 S3 interface 建立 key；需要先部署 S3 Gateway 並設定 AWS credentials
+
 ## 停止服務
 
 停止容器，但保留資料 volume：
