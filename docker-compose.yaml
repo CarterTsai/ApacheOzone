@@ -1,0 +1,119 @@
+x-image: &ozone-image
+  image: apache/ozone:2.1.0
+  restart: unless-stopped
+  user: root
+  networks:
+    - ozone
+
+x-common-config: &ozone-common-config
+  OZONE-SITE.XML_hdds.datanode.dir: /data/hdds
+  OZONE-SITE.XML_ozone.metadata.dirs: /data/metadata
+  OZONE-SITE.XML_ozone.om.address: om
+  OZONE-SITE.XML_ozone.om.http-address: om:9874
+  OZONE-SITE.XML_ozone.recon.address: recon:9891
+  OZONE-SITE.XML_ozone.recon.db.dir: /data/metadata/recon
+  OZONE-SITE.XML_ozone.replication: "1"
+  OZONE-SITE.XML_ozone.scm.block.client.address: scm
+  OZONE-SITE.XML_ozone.scm.client.address: scm
+  OZONE-SITE.XML_ozone.scm.datanode.id.dir: /data/metadata
+  OZONE-SITE.XML_ozone.scm.db.dirs: /data/metadata/scm-db
+  OZONE-SITE.XML_ozone.scm.names: scm
+  no_proxy: om,recon,scm,localhost,127.0.0.1
+
+services:
+  scm:
+    <<: *ozone-image
+    container_name: ozone-scm
+    command:
+      - bash
+      - -c
+      - |
+        if [ ! -f /data/metadata/scm/current/VERSION ]; then
+          ozone scm --init
+        fi
+        exec ozone scm
+    environment:
+      <<: *ozone-common-config
+    ports:
+      - "9876:9876"
+    volumes:
+      - scm-metadata:/data/metadata
+
+  om:
+    <<: *ozone-image
+    container_name: ozone-om
+    command:
+      - bash
+      - -c
+      - |
+        if [ ! -f /data/metadata/om/current/VERSION ]; then
+          ozone om --init
+        fi
+        exec ozone om
+    depends_on:
+      - scm
+    environment:
+      <<: *ozone-common-config
+      CORE-SITE.XML_hadoop.proxyuser.hadoop.groups: "*"
+      CORE-SITE.XML_hadoop.proxyuser.hadoop.hosts: "*"
+      WAITFOR: scm:9876
+    ports:
+      - "9874:9874"
+    volumes:
+      - om-metadata:/data/metadata
+
+  datanode:
+    <<: *ozone-image
+    container_name: ozone-datanode
+    command:
+      - bash
+      - -c
+      - |
+        until </dev/tcp/scm/9876 && </dev/tcp/om/9874 && </dev/tcp/recon/9891; do
+          echo "Waiting for scm:9876, om:9874, and recon:9891"
+          sleep 2
+        done
+        exec ozone datanode
+    depends_on:
+      - scm
+      - om
+      - recon
+    environment:
+      <<: *ozone-common-config
+    ports:
+      - "9864:9864"
+    volumes:
+      - datanode-data:/data
+
+  recon:
+    <<: *ozone-image
+    container_name: ozone-recon
+    command:
+      - bash
+      - -c
+      - |
+        until </dev/tcp/scm/9876 && </dev/tcp/om/9874; do
+          echo "Waiting for scm:9876 and om:9874"
+          sleep 2
+        done
+        exec ozone recon
+    depends_on:
+      - scm
+      - om
+    environment:
+      <<: *ozone-common-config
+    ports:
+      - "9888:9888"
+      - "9891:9891"
+    volumes:
+      - recon-metadata:/data/metadata
+
+networks:
+  ozone:
+    name: ozone
+
+volumes:
+  scm-metadata:
+  om-metadata:
+  datanode-data:
+  recon-metadata:
