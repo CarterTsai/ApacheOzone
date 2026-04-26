@@ -490,10 +490,17 @@ Iceberg 很強，但不是所有情境都該用。
 ### 2.2 建立虛擬環境與安裝 PySpark
 
 ```bash
-python3.10 -m venv .venv
+# 1. 建立 Python 3.10 的虛擬環境 (預設名稱就會是 .venv)
+uv venv --python 3.10
+
+# 2. 啟動虛擬環境 (與原本相同)
+## mac or linux
 source .venv/bin/activate
-pip install --upgrade pip
-pip install pyspark==3.5.4
+## windows
+.\.venv\Scripts\activate.ps1 
+
+# 3. 使用 uv pip 安裝套件
+uv pip install pyspark==3.5.4
 ```
 
 ### 2.3 PySpark 基本連線設定
