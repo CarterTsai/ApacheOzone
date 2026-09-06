@@ -1,139 +1,253 @@
-x-image: &ozone-image
-  image: apache/ozone:2.1.0
-  restart: unless-stopped
-  user: root
-  networks:
-    - ozone
+name: ozone
 
-x-common-config: &ozone-common-config
+x-ozone-logging: &ozone-logging
+  driver: local
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+x-ozone-image: &ozone-image
+  image: "${OZONE_IMAGE:-apache/ozone:2.2.1-all-in-one}"
+  restart: unless-stopped
+  init: true
+  # The upstream 2.2.1 image needs root for this local/staging baseline.
+  # Use a custom non-root image for a production deployment.
+  user: "${OZONE_RUNTIME_USER:-0:0}"
+  logging: *ozone-logging
+  stop_grace_period: 60s
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+  networks:
+    - ozone-backend
+
+x-common-config: &common-config
   OZONE-SITE.XML_hdds.datanode.dir: /data/hdds
-  OZONE-SITE.XML_hdds.scm.safemode.min.datanode: "3"
+  OZONE-SITE.XML_hdds.container.ratis.datanode.storage.dir: /data/ratis
+  OZONE-SITE.XML_hdds.scm.safemode.min.datanode: "${OZONE_SAFEMODE_MIN_DATANODES:-3}"
   OZONE-SITE.XML_ozone.metadata.dirs: /data/metadata
   OZONE-SITE.XML_ozone.om.address: om
   OZONE-SITE.XML_ozone.om.http-address: om:9874
   OZONE-SITE.XML_ozone.recon.address: recon:9891
+  # Keep the legacy in-metadata paths so an existing 2.1.x cluster can be
+  # upgraded without moving RocksDB files while the services are offline.
   OZONE-SITE.XML_ozone.recon.db.dir: /data/metadata/recon
-  OZONE-SITE.XML_ozone.replication: "3"
+  OZONE-SITE.XML_ozone.replication: "${OZONE_REPLICATION_FACTOR:-3}"
   OZONE-SITE.XML_ozone.replication.type: RATIS
   OZONE-SITE.XML_ozone.scm.block.client.address: scm
   OZONE-SITE.XML_ozone.scm.client.address: scm
   OZONE-SITE.XML_ozone.scm.datanode.id.dir: /data/metadata
   OZONE-SITE.XML_ozone.scm.db.dirs: /data/metadata/scm-db
+  OZONE-SITE.XML_ozone.scm.ha.ratis.snapshot.dir: /data/metadata/snapshot
+  OZONE-SITE.XML_ozone.scm.ha.ratis.storage.dir: /data/metadata/scm-ha
   OZONE-SITE.XML_ozone.scm.names: scm
-  no_proxy: om,recon,scm,localhost,127.0.0.1
+  no_proxy: om,recon,scm,s3g,datanode1,datanode2,datanode3,localhost,127.0.0.1
+
+x-scm-config: &scm-config
+  <<: *common-config
+
+x-om-config: &om-config
+  <<: *common-config
+  # This is the OM metadata root, not the RocksDB leaf directory. The
+  # existing 2.1.x layout stores om/current/VERSION and om.db below it.
+  OZONE-SITE.XML_ozone.om.db.dirs: /data/metadata
+  OZONE-SITE.XML_ozone.om.ratis.snapshot.dir: /data/metadata/snapshot
+  OZONE-SITE.XML_ozone.om.ratis.storage.dir: /data/metadata/ratis
+
+x-datanode: &datanode
+  <<: *ozone-image
+  command: ["ozone", "datanode"]
+  depends_on:
+    scm:
+      condition: service_healthy
+  environment: *common-config
+  healthcheck:
+    test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9882'"]
+    interval: 10s
+    timeout: 5s
+    retries: 30
+    start_period: 30s
 
 services:
-  scm:
+  # Initialization is deliberately separate from the long-running server so a
+  # restart never attempts to initialize an existing database again.
+  scm-init:
     <<: *ozone-image
-    container_name: ozone-scm
+    restart: "no"
     command:
       - bash
       - -c
       - |
-        if [ ! -f /data/metadata/scm/current/VERSION ]; then
+        if [ ! -f /data/metadata/scm-db/scm/current/VERSION ] && [ ! -f /data/metadata/scm/current/VERSION ]; then
           ozone scm --init
+        else
+          echo "SCM is already initialized"
         fi
-        exec ozone scm
-    environment:
-      <<: *ozone-common-config
-    ports:
-      - "9876:9876"
+    environment: *scm-config
     volumes:
       - scm-metadata:/data/metadata
 
-  om:
+  scm:
     <<: *ozone-image
-    container_name: ozone-om
+    command: ["ozone", "scm"]
+    depends_on:
+      scm-init:
+        condition: service_completed_successfully
+    environment: *scm-config
+    networks:
+      - ozone-backend
+      - ozone-admin
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-127.0.0.1}:9876:9876"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "bash -c '</dev/tcp/127.0.0.1/9860' && bash -c '</dev/tcp/127.0.0.1/9861'"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    stop_grace_period: 60s
+    volumes:
+      - scm-metadata:/data/metadata
+
+  om-init:
+    <<: *ozone-image
+    restart: "no"
     command:
       - bash
       - -c
       - |
         if [ ! -f /data/metadata/om/current/VERSION ]; then
           ozone om --init
+        else
+          echo "OM is already initialized"
         fi
-        exec ozone om
     depends_on:
-      - scm
-    environment:
-      <<: *ozone-common-config
-      CORE-SITE.XML_hadoop.proxyuser.hadoop.groups: "*"
-      CORE-SITE.XML_hadoop.proxyuser.hadoop.hosts: "*"
-      WAITFOR: scm:9876
-    ports:
-      - "9874:9874"
+      scm:
+        condition: service_healthy
+    environment: *om-config
     volumes:
       - om-metadata:/data/metadata
 
-  datanode:
+  om:
     <<: *ozone-image
-    command:
-      - bash
-      - -c
-      - |
-        until </dev/tcp/scm/9876 && </dev/tcp/om/9874 && </dev/tcp/recon/9891; do
-          echo "Waiting for scm:9876, om:9874, and recon:9891"
-          sleep 2
-        done
-        exec ozone datanode
+    command: ["bash", "-c", "exec ozone om $${OM_START_ARGS:-}"]
     depends_on:
-      - scm
-      - om
-      - recon
+      om-init:
+        condition: service_completed_successfully
     environment:
-      <<: *ozone-common-config
-    deploy:
-      replicas: 3
+      <<: *om-config
+      OM_START_ARGS: "${OM_START_ARGS:-}"
+    networks:
+      - ozone-backend
+      - ozone-admin
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-127.0.0.1}:9874:9874"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "bash -c '</dev/tcp/127.0.0.1/9862' && bash -c '</dev/tcp/127.0.0.1/9874'"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    stop_grace_period: 60s
     volumes:
-      - /data
+      - om-metadata:/data/metadata
+
+  datanode1:
+    <<: *datanode
+    hostname: datanode1
+    volumes:
+      - datanode1-metadata:/data/metadata
+      - datanode1-data:/data/hdds
+      - datanode1-ratis:/data/ratis
+
+  datanode2:
+    <<: *datanode
+    hostname: datanode2
+    volumes:
+      - datanode2-metadata:/data/metadata
+      - datanode2-data:/data/hdds
+      - datanode2-ratis:/data/ratis
+
+  datanode3:
+    <<: *datanode
+    hostname: datanode3
+    volumes:
+      - datanode3-metadata:/data/metadata
+      - datanode3-data:/data/hdds
+      - datanode3-ratis:/data/ratis
 
   recon:
     <<: *ozone-image
-    container_name: ozone-recon
-    command:
-      - bash
-      - -c
-      - |
-        until </dev/tcp/scm/9876 && </dev/tcp/om/9874; do
-          echo "Waiting for scm:9876 and om:9874"
-          sleep 2
-        done
-        exec ozone recon
+    command: ["ozone", "recon"]
     depends_on:
-      - scm
-      - om
-    environment:
-      <<: *ozone-common-config
+      scm:
+        condition: service_healthy
+      om:
+        condition: service_healthy
+    environment: *common-config
+    networks:
+      - ozone-backend
+      - ozone-admin
     ports:
-      - "9888:9888"
-      - "9891:9891"
+      - "${ADMIN_BIND_ADDRESS:-127.0.0.1}:9888:9888"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "bash -c '</dev/tcp/127.0.0.1/9888' && bash -c '</dev/tcp/127.0.0.1/9891'"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    stop_grace_period: 60s
     volumes:
       - recon-metadata:/data/metadata
 
   s3g:
     <<: *ozone-image
-    container_name: ozone-s3g
-    command:
-      - bash
-      - -c
-      - |
-        until </dev/tcp/om/9874; do
-          echo "Waiting for om:9874"
-          sleep 2
-        done
-        exec ozone s3g
+    command: ["ozone", "s3g"]
     depends_on:
-      - om
+      om:
+        condition: service_healthy
     environment:
-      <<: *ozone-common-config
+      <<: *common-config
       OZONE-SITE.XML_ozone.s3g.http-address: 0.0.0.0:9878
+    networks:
+      - ozone-backend
+      - ozone-edge
     ports:
-      - "9878:9878"
+      - "${S3G_BIND_ADDRESS:-127.0.0.1}:9878:9878"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9878'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    stop_grace_period: 60s
 
 networks:
-  ozone:
-    name: ozone
+  ozone-backend:
+    name: ozone-backend
+    internal: true
+  ozone-admin:
+    name: ozone-admin
+  ozone-edge:
+    name: ozone-edge
 
 volumes:
   scm-metadata:
   om-metadata:
   recon-metadata:
+  datanode1-metadata:
+  datanode1-data:
+  datanode1-ratis:
+  datanode2-metadata:
+  datanode2-data:
+  datanode2-ratis:
+  datanode3-metadata:
+  datanode3-data:
+  datanode3-ratis:

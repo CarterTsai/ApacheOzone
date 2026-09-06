@@ -838,23 +838,23 @@ AS SELECT * FROM local.demo.sales WHERE amount >= 2000;
 version: '3.8'
 services:
   om:
-    image: apache/ozone:2.1.0
+    image: apache/ozone:2.2.1
     environment:
       - OZONE_NODE_TYPE=om
     command: ["sh", "-c", "ozone om"]
   scm:
-    image: apache/ozone:2.1.0
+    image: apache/ozone:2.2.1
     environment:
       - OZONE_NODE_TYPE=scm
     command: ["sh", "-c", "ozone scm"]
   datanode:
-    image: apache/ozone:2.1.0
+    image: apache/ozone:2.2.1
     depends_on: [om, scm]
     environment:
       - OZONE_NODE_TYPE=datanode
     command: ["sh", "-c", "ozone datanode"]
   s3gateway:
-    image: apache/ozone:2.1.0
+    image: apache/ozone:2.2.1
     ports:
       - "9878:9878"
     depends_on: [om, scm, datanode]

@@ -1,325 +1,244 @@
-# Apache Ozone 2.1.0 Docker Compose 使用說明
+# Apache Ozone 2.2.1 Docker Compose
 
-這個目錄提供一份 Apache Ozone 2.1.0 的單機 Docker Compose 環境，包含以下服務：
+這份設定是單一 Docker host 的 staging / POC 基線，包含：
 
-- Ozone Manager: `om`
-- Storage Container Manager: `scm`
-- DataNode: `datanode`
-- Recon: `recon`
+- Ozone Manager（OM）
+- Storage Container Manager（SCM）
+- 3 個固定 DataNode
+- Recon
+- S3 Gateway（S3G）
 
-這份 compose 是單 DataNode 測試環境，因此已設定 `hdds.scm.safemode.min.datanode=1`。如果改成多 DataNode 或正式環境，請依實際節點數調整 safe mode 設定。
+它不是跨主機的 production HA 叢集。Apache 官方 Docker Compose 文件定位為開發、測試與評估用途；正式環境請使用 bare metal 或 Kubernetes，並依環境建立 HA 拓撲。
 
-## 環境需求
+## 需求
 
-- Docker
-- Docker Compose v2
+- Docker Engine 24+ 或 Docker Desktop
+- Docker Compose v2（使用 `docker compose`，不是舊版 `docker-compose`）
+- 至少 8 GB RAM；壓測或大量資料請提高 CPU、RAM 與磁碟容量
 
-確認 Docker Compose 可用：
+## 快速啟動
+
+第一次啟動前，複製環境檔：
 
 ```powershell
-docker compose version
+Copy-Item .env.example .env
 ```
 
-## 啟動服務
-
-在本目錄執行：
+啟動：
 
 ```powershell
+docker compose pull
 docker compose up -d
 ```
 
-第一次啟動時，`scm` 和 `om` 會自動執行初始化：
+SCM 與 OM 的初始化現在由 `scm-init`、`om-init` 一次性服務執行；完成後才會啟動長駐服務。
 
-- `ozone scm --init`
-- `ozone om --init`
-
-初始化完成後會接著啟動對應服務。後續重啟時，如果 volume 中已經存在初始化資料，就不會再次初始化。
-
-## 查看服務狀態
+查看狀態：
 
 ```powershell
 docker compose ps
+docker compose logs -f scm om datanode1 datanode2 datanode3 recon s3g
 ```
 
-查看所有服務 log：
+`scm-init` 與 `om-init` 正常完成後顯示 `Exited (0)` 是預期結果。長駐服務應為 `Up`，且 health 欄位應為 `healthy`。
+
+## 管理介面
+
+預設只綁定本機：
+
+- OM：<http://127.0.0.1:9874>
+- SCM：<http://127.0.0.1:9876>
+- Recon：<http://127.0.0.1:9888>
+- S3G：<http://127.0.0.1:9878>
+
+DataNode 管理埠刻意不發布到 host；DataNode 只在 `ozone-backend` 網路提供服務。需要臨時查看時，可從容器內檢查：
 
 ```powershell
-docker compose logs -f
+docker compose exec datanode1 bash -lc "bash -c '</dev/tcp/127.0.0.1/9882'"
 ```
 
-只查看單一服務 log：
+若必須讓其他主機存取管理介面，先在防火牆或反向代理限制來源，再在 `.env` 設定 `ADMIN_BIND_ADDRESS`。不要直接把所有管理埠公開到 Internet。
+
+## Ozone 健康檢查
 
 ```powershell
-docker compose logs -f scm
-docker compose logs -f om
-docker compose logs -f datanode
-docker compose logs -f recon
+docker compose ps
+docker compose exec -T om ozone admin datanode list
+docker compose exec -T om ozone admin safemode status
+docker compose exec -T om ozone sh volume list /
 ```
 
-## Web UI
+預期有 3 個 DataNode，並且 SCM 最終離開 safemode。若剛啟動時仍在 safemode，等待 DataNode 完成註冊後再檢查。
 
-啟動後可開啟以下頁面：
+## S3 Client
 
-- Ozone Manager: http://localhost:9874
-- DataNode: http://localhost:9864
-- Recon: http://localhost:9888
-
-SCM 和 Recon RPC 服務對外開放在：
-
-- SCM: `localhost:9876`
-- Recon RPC: `localhost:9891`
-
-## 基本驗證
-
-確認 Ozone CLI 可連到服務：
+S3G endpoint 是 `http://127.0.0.1:9878`。先建立 volume 與 bucket：
 
 ```powershell
-docker compose exec om ozone sh volume list /
-docker compose exec om ozone admin datanode list
+docker compose exec -T om ozone sh volume create /s3v
+docker compose exec -T om ozone sh bucket create /s3v/demo
 ```
 
-查看容器內 Ozone 設定：
+使用 AWS CLI：
 
 ```powershell
-docker compose exec om ozone getconf -confKey ozone.om.address
-docker compose exec om ozone getconf -confKey ozone.scm.names
+$env:AWS_ACCESS_KEY_ID = "demo"
+$env:AWS_SECRET_ACCESS_KEY = "demo-secret"
+
+aws --endpoint-url http://127.0.0.1:9878 s3api list-buckets
+"hello ozone" | Set-Content -NoNewline sample.txt
+aws --endpoint-url http://127.0.0.1:9878 s3 cp sample.txt s3://s3v/demo/sample.txt
+aws --endpoint-url http://127.0.0.1:9878 s3 cp s3://s3v/demo/sample.txt sample-download.txt
 ```
 
-建立測試 bucket 前，先建立 volume 和 bucket：
+實際環境請使用 IAM / Ranger、TLS，以及外部 secret manager 管理憑證，不要把 access key 寫進 Compose。
+
+## 壓測
+
+Freon 適合先驗證叢集功能與粗略效能。以下範例使用 3 副本設定：
 
 ```powershell
-docker compose exec om ozone sh volume create /testvol
-docker compose exec om ozone sh bucket create /testvol/testbucket
-docker compose exec om ozone sh volume list /
-docker compose exec om ozone sh bucket list /testvol
+docker compose exec -T om ozone freon randomkeys --numOfVolumes 1 --numOfBuckets 1 --numOfKeys 1000 --keySize 1024 --valueSize 4096 --replication=THREE
 ```
 
-## Freon 壓測
-
-Apache Ozone 內建 Freon 作為 load generator / tester。可先查看可用的壓測命令：
+大規模壓測前，請先確認磁碟、CPU、JVM heap、網路頻寬與 replication policy，並使用獨立的測試 volume。測試後先列出 volume，再只刪除已確認的測試 volume：
 
 ```powershell
-docker compose exec om ozone freon --help
+docker compose exec -T om ozone sh volume list /
+docker compose exec -T om ozone sh volume delete /s3v
 ```
 
-查看 `randomkeys` 參數：
+上例的 `/s3v` 只適用於你確定要刪除該測試 volume 的情況；正式資料禁止直接刪除。
+
+S3 相容性與應用程式吞吐量，請使用 AWS CLI、s5cmd、Warp 或實際 SDK 從 S3G 測試；不要只用 Freon 結果代表 S3 效能。
+
+## Volume 與資料保留
+
+目前使用具名 Docker volumes。為了相容既有 2.1.x 叢集，SCM、OM、Recon 的 RocksDB 與 Ratis 暫時保留在各自的 metadata volume 內；每個 DataNode 則使用獨立的 metadata、Ratis 與資料 volume。這些 volumes 通常仍位於同一台 Docker host，不能取代實體磁碟、跨主機複本或備份。
+
+查看 volume：
 
 ```powershell
-docker compose exec om ozone freon randomkeys --help
+docker volume ls --filter label=com.docker.compose.project=ozone
 ```
 
-### 寫入 key 壓測
-
-以下範例會建立 1 個 volume、1 個 bucket，並寫入 1000 個 10KB key：
-
-```powershell
-docker compose exec om ozone freon randomkeys `
-  --num-of-volumes=1 `
-  --num-of-buckets=1 `
-  --num-of-keys=1000 `
-  --key-size=10KB `
-  --num-of-threads=10 `
-  --type=RATIS `
-  --replication=ONE
-```
-
-這份 compose 是單 DataNode 環境，請使用 `--replication=ONE`。不要使用 Freon 預設的 replication factor `THREE`，否則會因為 DataNode 數量不足導致壓測失敗或卡住。
-
-### 小量測試
-
-第一次測試可以先用較小的 key 數量確認流程：
-
-```powershell
-docker compose exec om ozone freon randomkeys `
-  --num-of-volumes=1 `
-  --num-of-buckets=1 `
-  --num-of-keys=10 `
-  --key-size=1KB `
-  --num-of-threads=2 `
-  --type=RATIS `
-  --replication=ONE
-```
-
-### 驗證寫入
-
-壓測時加上 `--validate-writes` 可以在寫入後驗證 key：
-
-```powershell
-docker compose exec om ozone freon randomkeys `
-  --num-of-volumes=1 `
-  --num-of-buckets=1 `
-  --num-of-keys=100 `
-  --key-size=10KB `
-  --num-of-threads=5 `
-  --type=RATIS `
-  --replication=ONE `
-  --validate-writes
-```
-
-### 清理測試資料
-
-`randomkeys` 可加上 `--clean-objects` 清理 Freon 隨機建立的 volume、bucket 和 key：
-
-```powershell
-docker compose exec om ozone freon randomkeys `
-  --num-of-volumes=1 `
-  --num-of-buckets=1 `
-  --num-of-keys=100 `
-  --key-size=10KB `
-  --num-of-threads=5 `
-  --type=RATIS `
-  --replication=ONE `
-  --clean-objects
-```
-
-### 常用 Freon 子命令
-
-- `randomkeys` / `rk`: 建立 volume、bucket，並寫入隨機 key
-- `ockg`: 使用 Ozone client 建立 key
-- `ockv`: 驗證 key
-- `ockr`: 刪除 key
-- `om-echo`: 測試 OM RPC
-- `dn-echo`: 測試 DataNode RPC
-- `scm-throughput-benchmark`: 測試 SCM throughput
-- `s3kg`: 透過 S3 interface 建立 key；需要先部署 S3 Gateway 並設定 AWS credentials
-
-## 停止服務
-
-停止容器，但保留資料 volume：
-
-```powershell
-docker compose down
-```
-
-重新啟動：
-
-```powershell
-docker compose up -d
-```
-
-## 重建容器
-
-如果修改了 `docker-compose.yaml`，可重建容器：
-
-```powershell
-docker compose up -d --force-recreate
-```
-
-## 清除所有資料並重新初始化
-
-如果初始化失敗，或想要完整重建一個乾淨的 Ozone 環境，可以刪除容器和 volume：
+升級既有資料時只執行 `docker compose down`，不要使用 `down -v`。本 Compose 已恢復 2.1.x 使用的 control-plane metadata 路徑，讓 2.2.1 可以讀取原 cluster state。
 
 ```powershell
 docker compose down -v
 docker compose up -d
 ```
 
-注意：`docker compose down -v` 會刪除 Ozone metadata 和 DataNode 資料，不能復原。
+`down -v` 會刪除 Ozone 資料，正式環境禁止直接執行。要保留資料，請先做停機備份與目錄遷移，再啟動新設定。
+
+## 企業環境還需要補上的項目
+
+這份 Compose 已處理單機 staging 常見的啟動順序、healthcheck、資料目錄、管理面隔離與 log rotation；以下項目不能靠通用單機 Compose 安全地代替：
+
+1. 3 個 OM 與 3 個 SCM，啟用 OM/SCM HA Ratis，並放在不同故障域。
+2. 至少 3 個跨主機、跨 rack / AZ 的 DataNode；目前 3 個 DataNode 都在同一台 Docker host。
+3. 2 個以上 S3G，放在 TLS reverse proxy 或 load balancer 後方。
+4. 每個 DataNode 使用 direct-attached HDD / JBOD；metadata 與 Ratis 使用獨立 SSD / NVMe。避免 NAS / SAN 作為核心資料層。
+5. 使用自建、固定 digest、非 root 的 Ozone image；建立 image 掃描與升級回滾流程。
+6. Kerberos、TLS、Ranger / IAM、secret manager、audit log 與網路 ACL。
+7. Prometheus / Grafana、集中式 logs、告警、備份、restore 演練與 disaster recovery runbook。
+8. rack / topology 設定、容量規劃、JVM heap、ulimit、磁碟與網路監控。
+
+### 建議的正式部署方向
+
+- 單機開發或整合測試：使用本檔案。
+- 企業 production：使用 Ozone 官方 production 拓撲，在 bare metal 或 Kubernetes 建立 3 OM、3 SCM、3+ DataNode、2+ S3G，並以外部 LB、TLS、Kerberos、監控與備份系統整合。
 
 ## 常見問題
 
-### SCM 顯示 `Unknown option: '-init'`
+### `Unknown option: '-init'`
 
-Ozone 2.1.0 的 SCM 初始化參數是 `--init`，不是 `-init`。本 compose 檔已經在 `scm` command 中明確使用：
+正確語法是 `ozone scm --init` 與 `ozone om --init`。本檔案已由 `scm-init` / `om-init` 使用正確語法，不要執行 `ozone scm -init`。
 
-```bash
-ozone scm --init
+### `Failed to set directory permissions ... Operation not permitted`
+
+這通常是 bind mount 權限或容器使用者不匹配。此 staging 設定預設使用 `OZONE_RUNTIME_USER=0:0` 以配合 upstream image；production 應改用自建非 root image，並在 host 先建立目錄、設定正確 UID/GID 與 mount 權限。
+
+### OM `Storage is not initialized yet`
+
+若這是在 2.1.x 升級到 2.2.1 後出現，通常是 OM 仍以一般模式啟動。不要重跑 `om-init`，也不要刪除 `ozone_om-metadata`；升級啟動必須帶 `--upgrade`。本專案提供一次性 override：
+
+```powershell
+docker compose down
+docker compose -f docker-compose.yaml -f docker-compose.upgrade.yaml up -d scm datanode1 datanode2 datanode3
+docker compose -f docker-compose.yaml -f docker-compose.upgrade.yaml up -d --force-recreate om
+docker compose logs --tail=200 om
 ```
 
-如果仍看到舊錯誤，請確認使用的是目前這份 `docker-compose.yaml`，並重建容器：
+確認 OM 已進入 pre-finalized 狀態後，改回一般啟動設定：
+
+```powershell
+docker compose up -d --force-recreate om recon s3g
+```
+
+不要在日常重啟時持續使用 `docker-compose.upgrade.yaml`。`om-init` 顯示 `OM is already initialized` 只代表找到既有 `VERSION`，不代表已完成版本升級。
+
+### DataNode 反覆連線 Recon `9891`
+
+DataNode 不應以 Recon 作為啟動依賴。此設定已移除 DataNode 對 Recon 的依賴；DataNode 只等待 SCM，Recon 自己等待 OM 與 SCM。若仍看到舊訊息，請確認使用的是目前 `docker-compose.yaml` 並重新建立容器：
 
 ```powershell
 docker compose up -d --force-recreate
 ```
 
-如果之前已有半初始化的 volume，可清除資料後重新啟動：
+### S3G 無法連線
 
 ```powershell
-docker compose down -v
-docker compose up -d
+docker compose ps s3g om
+docker compose logs --tail=200 s3g om
+Test-NetConnection 127.0.0.1 -Port 9878
 ```
 
-### Docker 顯示 `Access is denied`
+確認 OM 為 `healthy`、S3G 為 `healthy`，並確認 `.env` 的 `S3G_BIND_ADDRESS` 沒有綁到錯誤的 host interface。
 
-如果看到類似訊息：
+## 從 2.1.0 升級到 2.2.1
 
-```text
-Error loading config file: open C:\Users\...\ .docker\config.json: Access is denied
-```
+2.2.1 是 Apache Ozone 的 maintenance release。現有資料升級請採 non-rolling 流程，不要直接刪除 volumes；官方流程會先進入 pre-finalized 狀態，確認穩定後才 finalize。Finalize 後將不能回復到舊版本。
 
-請確認目前使用者有權限讀取 Docker 設定，並確認 Docker Desktop 已啟動。若服務仍能正常啟動，這通常不是 `docker-compose.yaml` 語法錯誤。
-
-### SCM 顯示 `Failed to set directory permissions for /data/metadata`
-
-如果 SCM log 出現：
-
-```text
-Failed to set directory permissions for /data/metadata: /data/metadata: Operation not permitted
-```
-
-這通常是 Docker volume 權限和 Ozone container 使用者不一致造成的。本 compose 檔已設定服務用 `root` 使用者啟動，讓 Ozone 可以調整 `/data/metadata` 的 POSIX 權限。
-
-修改 compose 後請重建容器：
+先確認目前叢集健康並完成備份：
 
 ```powershell
-docker compose up -d --force-recreate
+docker compose ps
+docker compose exec -T om ozone admin datanode list
+docker compose exec -T om ozone admin om finalizationstatus
+docker compose exec -T om ozone admin scm finalizationstatus
 ```
 
-如果之前的 volume 已經留下錯誤權限或半初始化資料，請清除 volume 後重新啟動：
+確認 `.env` 的 `OZONE_IMAGE` 已改為 `apache/ozone:2.2.1-all-in-one`，然後停止所有元件但保留 volumes：
 
 ```powershell
-docker compose down -v
-docker compose up -d
+docker compose down
+docker compose pull
 ```
 
-注意：`docker compose down -v` 會刪除 Ozone metadata 和 DataNode 資料，不能復原。
-
-### DataNode 顯示 `Retrying connect to server: recon/...:9891`
-
-DataNode 會連到 Recon 的 RPC port `9891` 回報狀態。如果 Recon 還在啟動中，DataNode log 可能短暫出現：
-
-```text
-Retrying connect to server: recon/...:9891
-```
-
-本 compose 檔已設定 DataNode 等待 `scm:9876`、`om:9874`、`recon:9891` 後再啟動，並將 Recon RPC port `9891` 對外開放。
-
-修改 compose 後請重建容器：
+本次先前的錯誤啟動曾建立新的 SCM/DataNode cluster ID。停止服務後，若要保留原本的 cluster，請先確認三個新 DataNode volumes 都沒有需要保留的資料，再清除它們，讓 DataNode 重新向原 SCM 註冊。由於 ClusterID 也寫在 `/data/hdds/hdds/VERSION`，data volume 不能漏掉：
 
 ```powershell
-docker compose up -d --force-recreate
+docker volume rm ozone_datanode1-metadata ozone_datanode1-data ozone_datanode1-ratis
+docker volume rm ozone_datanode2-metadata ozone_datanode2-data ozone_datanode2-ratis
+docker volume rm ozone_datanode3-metadata ozone_datanode3-data ozone_datanode3-ratis
 ```
 
-如果仍持續出現，請先看 Recon 是否啟動成功：
+不要刪除 `ozone_scm-metadata`、`ozone_om-metadata` 或 `ozone_recon-metadata`。若任一 DataNode data volume 不是空的，先備份並確認資料歸屬後再決定是否清理。
+
+以一次性 override 的 `--upgrade` 啟動 OM：
 
 ```powershell
-docker compose logs -f recon
+docker compose -f docker-compose.yaml -f docker-compose.upgrade.yaml up -d --force-recreate
 docker compose ps
 ```
 
-### S3
-
-啟動後，用 AWS CLI 連：
+確認 OM、SCM 與 DataNode 正常、cluster ID 一致後，先觀察一段時間。確定不需要 rollback，再依官方流程 finalize SCM 與 OM：
 
 ```powershell
-$env:AWS_ACCESS_KEY_ID="test"
-$env:AWS_SECRET_ACCESS_KEY="test"
-aws configure set default.s3.addressing_style path
-aws --endpoint-url http://localhost:9878 s3api list-buckets
+docker compose exec -T om ozone admin scm finalizeupgrade
+docker compose exec -T om ozone admin om finalizeupgrade -id=<om-service-id>
+docker compose up -d --force-recreate om
 ```
 
-你這個 compose 沒有開 Ozone security，所以 access key / secret 可以先用任意值，例如 `test/test`。
-
-建立 bucket、上傳、下載：
-
-```powershell
-aws --endpoint-url http://localhost:9878 s3api create-bucket --bucket bucket1
-
-aws --endpoint-url http://localhost:9878 s3 cp README.md s3://bucket1/README.md
-
-aws --endpoint-url http://localhost:9878 s3 ls s3://bucket1/
-
-aws --endpoint-url http://localhost:9878 s3 cp s3://bucket1/README.md .\README.download.md
-```
-
-Ozone S3 bucket 會對應到 Ozone 內部的 `/s3v` volume 底下。官方文件也說明：S3 Gateway 是額外服務，S3 buckets 會存在 `/s3v`，未啟用 security 時可以用任意 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。參考：[Ozone S3 API docs](https://ozone.apache.org/docs/user-guide/client-interfaces/s3/s3-api)。
+`<om-service-id>` 必須替換成 `finalizationstatus` 顯示的 OM service ID。若升級後仍在 pre-finalized 狀態，維持該狀態即可保留 rollback 選項。參考：[Ozone 2.2.1 release notes](https://ozone.apache.org/release-notes/2.2.1/) 與 [Upgrade and Downgrade](https://ozone.apache.org/docs/administrator-guide/operations/upgrade-and-downgrade/)。

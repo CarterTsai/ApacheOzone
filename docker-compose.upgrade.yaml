@@ -1,0 +1,7 @@
+# One-time non-rolling upgrade override for an existing Ozone 2.1.x cluster.
+# Use together with docker-compose.yaml, then switch back to the base file
+# after OM reaches the pre-finalized state or after finalization.
+services:
+  om:
+    environment:
+      OM_START_ARGS: "--upgrade"
