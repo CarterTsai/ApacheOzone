@@ -148,7 +148,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - "bash -c '</dev/tcp/127.0.0.1/9862' && bash -c '</dev/tcp/127.0.0.1/9874'"
+        - "bash -c '</dev/tcp/om/9862' && bash -c '</dev/tcp/127.0.0.1/9874'"
       interval: 10s
       timeout: 5s
       retries: 30

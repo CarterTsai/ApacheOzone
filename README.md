@@ -18,20 +18,85 @@
 
 ## 快速啟動
 
-第一次啟動前，複製環境檔：
+第一次啟動前，複製環境檔並下載 image：
 
 ```powershell
 Copy-Item .env.example .env
+docker compose pull
 ```
 
-啟動：
+啟動完整 stack：
 
 ```powershell
-docker compose pull
 docker compose up -d
 ```
 
-SCM 與 OM 的初始化現在由 `scm-init`、`om-init` 一次性服務執行；完成後才會啟動長駐服務。
+Compose 會依下列順序處理服務：
+
+1. `scm-init` 檢查並初始化 SCM metadata。
+2. `scm` 通過 healthcheck 後，三個 DataNode 開始註冊 SCM。
+3. `om-init` 等待 SCM healthy，檢查並初始化 OM metadata。
+4. `om` 啟動並通過 healthcheck。
+5. `recon` 與 `s3g` 等待 OM healthy 後啟動。
+
+`scm-init` 與 `om-init` 是一次性服務；正常完成後顯示 `Exited (0)`，不是錯誤。
+
+## 正確啟動流程
+
+### 日常啟動
+
+已有 initialized volumes 時，每次啟動只使用 base Compose：
+
+```powershell
+docker compose up -d
+docker compose ps
+```
+
+不要在日常啟動使用 `docker-compose.upgrade.yaml`。該檔案只在 Ozone 版本升級的第一次 OM 啟動時使用。
+
+### 啟動完成判斷
+
+容器全部啟動後，確認長駐服務為 `healthy`：
+
+```powershell
+docker compose ps
+docker compose exec -T scm ozone admin datanode list
+docker compose logs --tail=100 scm
+```
+
+正常結果應符合：
+
+- `scm`、`om`、`recon`、`s3g`、`datanode1`、`datanode2`、`datanode3` 都是 `healthy`。
+- SCM 顯示 3 個 DataNode，狀態為 `Operational State: IN_SERVICE`、`Health State: HEALTHY`。
+- SCM log 顯示 `registered datanodes (=3)`，並顯示 `state=OUT_OF_SAFE_MODE`。
+
+剛啟動時 DataNode 尚未註冊，SCM 暫時在 safemode 是正常現象；等待 1 至 2 分鐘後再檢查。若持續沒有 3 個 DataNode，查看：
+
+```powershell
+docker compose logs --tail=200 datanode1 datanode2 datanode3 scm
+```
+
+### 重啟與停止
+
+只重啟服務時，建議讓 Compose 重新套用依賴條件：
+
+```powershell
+docker compose up -d --force-recreate
+```
+
+暫停服務但保留 containers 與 volumes：
+
+```powershell
+docker compose stop
+```
+
+移除 containers 與 networks，但保留所有資料 volumes：
+
+```powershell
+docker compose down
+```
+
+不要使用 `docker compose down -v`，除非這是可丟棄的測試環境且確認不需要任何資料。
 
 查看狀態：
 
@@ -204,9 +269,8 @@ Test-NetConnection 127.0.0.1 -Port 9878
 
 ```powershell
 docker compose ps
-docker compose exec -T om ozone admin datanode list
-docker compose exec -T om ozone admin om finalizationstatus
-docker compose exec -T om ozone admin scm finalizationstatus
+docker compose exec -T scm ozone admin datanode list
+docker compose exec -T scm ozone admin scm finalizationstatus
 ```
 
 確認 `.env` 的 `OZONE_IMAGE` 已改為 `apache/ozone:2.2.1-all-in-one`，然後停止所有元件但保留 volumes：
@@ -233,7 +297,7 @@ docker compose -f docker-compose.yaml -f docker-compose.upgrade.yaml up -d --for
 docker compose ps
 ```
 
-確認 OM、SCM 與 DataNode 正常、cluster ID 一致後，先觀察一段時間。確定不需要 rollback，再依官方流程 finalize SCM 與 OM：
+確認 OM、SCM 與 DataNode 正常、cluster ID 一致後，先觀察一段時間。確定不需要 rollback，再依官方流程 finalize SCM 與 OM。若是本檔案的單 OM、非 HA 叢集，初始化時沒有設定 OM service ID，不要事後新增 `ozone.om.service.ids`；應先維持 pre-finalized 狀態，或依正式 HA migration 流程處理：
 
 ```powershell
 docker compose exec -T om ozone admin scm finalizeupgrade
@@ -241,4 +305,4 @@ docker compose exec -T om ozone admin om finalizeupgrade -id=<om-service-id>
 docker compose up -d --force-recreate om
 ```
 
-`<om-service-id>` 必須替換成 `finalizationstatus` 顯示的 OM service ID。若升級後仍在 pre-finalized 狀態，維持該狀態即可保留 rollback 選項。參考：[Ozone 2.2.1 release notes](https://ozone.apache.org/release-notes/2.2.1/) 與 [Upgrade and Downgrade](https://ozone.apache.org/docs/administrator-guide/operations/upgrade-and-downgrade/)。
+`<om-service-id>` 必須替換成既有環境中已設定的 OM service ID。若升級後仍在 pre-finalized 狀態，維持該狀態即可保留 rollback 選項。參考：[Ozone 2.2.1 release notes](https://ozone.apache.org/release-notes/2.2.1/) 與 [Upgrade and Downgrade](https://ozone.apache.org/docs/administrator-guide/operations/upgrade-and-downgrade/)。
